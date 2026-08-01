@@ -104,13 +104,21 @@ def _build_adf_description(description: str, acceptance_criteria: List[Dict[str,
     return {"type": "doc", "version": 1, "content": content}
 
 
+AUTOMATION_LABEL = "Automated-Jira-Creation"
+
+
 def _build_issue_payload(
     project_key: str,
     story: Dict[str, Any],
     issue_type: str = "Story",
 ) -> Dict[str, Any]:
     """Builds the Jira issue-create payload for a single story (used by both
-    the real push and the dry-run preview, so they never drift apart)."""
+    the real push and the dry-run preview, so they never drift apart).
+
+    Every issue created this way is automatically tagged with
+    AUTOMATION_LABEL, in addition to any story-specific labels, so
+    tool-generated issues are easy to find/filter in Jira.
+    """
     payload = {
         "fields": {
             "project": {"key": project_key},
@@ -122,8 +130,10 @@ def _build_issue_payload(
         }
     }
 
-    if story.get("labels"):
-        payload["fields"]["labels"] = story["labels"]
+    labels = list(story.get("labels") or [])
+    if AUTOMATION_LABEL not in labels:
+        labels.append(AUTOMATION_LABEL)
+    payload["fields"]["labels"] = labels
 
     priority = story.get("priority")
     if priority:
