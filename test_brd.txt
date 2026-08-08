@@ -1,0 +1,8 @@
+Test BRD - Tool Verification
+
+The system shall allow a user to click a "Test" button on the dashboard,
+which displays a confirmation message on screen.
+
+Requirements
+1. A "Test" button is visible on the dashboard for logged-in users.
+2. Clicking the button displays a confirmation message within 1 second.
