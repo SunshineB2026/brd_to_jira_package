@@ -6,13 +6,16 @@ Parses a BRD (docx/pdf/txt/md) and generates a single, consolidated Jira
 story (with all acceptance criteria bundled into that one story) using
 Claude for the actual writing.
 
-Two modes:
+Three modes:
 
   new     BRD only -> generate a brand new Jira story from scratch.
   update  Existing Jira story + BRD -> generate a detailed/updated version
           of that same story (still one consolidated story).
+  enrich  Existing Jira story ONLY (no BRD) -> expand that story's own
+          content into full detail (acceptance criteria, positive/negative
+          test cases, exit criteria) using nothing but what's already there.
 
-In both modes the output is always ONE story, not one story per
+In all modes the output is always ONE story, not one story per
 requirement. Acceptance criteria accumulate inside that single story
 even if it gets long.
 
@@ -28,12 +31,17 @@ Usage:
       --output out/story.json \
       [--push]
 
+  python brd_to_jira.py enrich \
+      --jira-key BX-1116 \
+      --output out/story.json \
+      [--push]
+
 Environment variables:
   ANTHROPIC_API_KEY   required, used to call Claude for generation
-  JIRA_BASE_URL        required only if --push is used, e.g. https://yourco.atlassian.net
-  JIRA_EMAIL           required only if --push is used
-  JIRA_API_TOKEN       required only if --push is used
-  JIRA_PROJECT_KEY     required only if --push is used, e.g. "BOX"
+  JIRA_BASE_URL        required to fetch via --jira-key, or if --push is used
+  JIRA_EMAIL           required to fetch via --jira-key, or if --push is used
+  JIRA_API_TOKEN       required to fetch via --jira-key, or if --push is used
+  JIRA_PROJECT_KEY     required only if --push is used for a brand new issue
 """
 
 import argparse
@@ -302,6 +310,26 @@ rules in your system prompt.
 """
 
 
+def build_enrich_only_prompt(existing_story: dict) -> str:
+    return f"""Here is an EXISTING Jira story. There is no separate BRD —
+this story's own summary/description is the only source of requirements
+you have to work with:
+
+---EXISTING STORY START---
+{existing_story['raw']}
+---EXISTING STORY END---
+
+Produce a detailed, expanded version of this SAME story (do not create a
+second story). Keep the same intent and scope — do not invent new
+requirements beyond what's implied by the existing content — but flesh out
+the description, and add a full set of acceptance criteria,
+positive/negative test cases, and exit criteria, all inferred from what's
+already written here. If the existing description is vague or thin in a
+particular area, keep that part of your output conservative rather than
+guessing at specifics it doesn't support.
+"""
+
+
 # --------------------------------------------------------------------------
 # Claude call
 # --------------------------------------------------------------------------
@@ -490,8 +518,73 @@ def push_to_jira(story: dict, existing_key: str = "", attach_path: str = "") -> 
 # CLI
 # --------------------------------------------------------------------------
 
+def build_output_path(output_arg: str, key: str = "") -> Path:
+    """
+    If a Jira key is known, prefix the output filename with it
+    (out/story.json -> out/BX-1118_story.json) so generated files are easy
+    to tell apart at a glance. Directory is preserved as given.
+    """
+    p = Path(output_arg)
+    if key:
+        return p.with_name(f"{key}_{p.name}")
+    return p
+
+
+def jira_browse_url(key: str) -> str:
+    """Build a clickable https://.../browse/<key> URL, if JIRA_BASE_URL is set."""
+    base_url = os.environ.get("JIRA_BASE_URL")
+    if base_url and key:
+        return f"{base_url.rstrip('/')}/browse/{key}"
+    return ""
+
+
+def story_to_markdown(story: dict, key: str = "") -> str:
+    """
+    Render a story dict as readable Markdown — headed sections with real
+    bulleted/numbered lists, instead of a raw JSON dump.
+    """
+    lines = []
+
+    title = story.get("summary", "").strip()
+    lines.append(f"# {title}" if title else "# (untitled story)")
+    if key:
+        lines.append(f"\n**Jira key:** {key}")
+        browse_url = jira_browse_url(key)
+        if browse_url:
+            lines.append(f"**Link:** {browse_url}")
+    lines.append("")
+
+    description = story.get("description", "").strip()
+    if description:
+        lines.append("## Description\n")
+        lines.append(description)
+        lines.append("")
+
+    def add_section(title: str, items: list, numbered: bool = False) -> None:
+        if not items:
+            return
+        lines.append(f"## {title}\n")
+        for i, item in enumerate(items, 1):
+            bullet = f"{i}." if numbered else "-"
+            lines.append(f"{bullet} {item}")
+        lines.append("")
+
+    add_section("Acceptance Criteria", story.get("acceptance_criteria", []), numbered=True)
+    add_section("Positive Test Cases", story.get("positive_test_cases", []))
+    add_section("Negative Test Cases", story.get("negative_test_cases", []))
+    add_section("Exit Criteria", story.get("exit_criteria", []))
+
+    labels = story.get("labels", [])
+    if labels:
+        lines.append("## Labels\n")
+        lines.append(", ".join(labels))
+        lines.append("")
+
+    return "\n".join(lines).strip() + "\n"
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Generate a Jira story from a BRD.")
+    parser = argparse.ArgumentParser(description="Generate a Jira story from a BRD and/or existing Jira content.")
     subparsers = parser.add_subparsers(dest="mode", required=True)
 
     new_parser = subparsers.add_parser("new", help="Generate a brand new story from a BRD only.")
@@ -503,24 +596,39 @@ def main():
 
     update_parser = subparsers.add_parser("update", help="Enrich an existing story using a BRD.")
     update_parser.add_argument("--brd", required=True, help="Path to BRD file (.docx/.pdf/.txt/.md)")
-    story_source = update_parser.add_mutually_exclusive_group(required=True)
-    story_source.add_argument("--existing-story", help="Path to existing story (.json/.txt/.md)")
-    story_source.add_argument("--jira-key", help="Jira issue key to fetch live, e.g. BOX-142 (requires JIRA_* env vars)")
+    update_source = update_parser.add_mutually_exclusive_group(required=True)
+    update_source.add_argument("--existing-story", help="Path to existing story (.json/.txt/.md)")
+    update_source.add_argument("--jira-key", help="Jira issue key to fetch live, e.g. BOX-142 (requires JIRA_* env vars)")
     update_parser.add_argument("--output", required=True, help="Path to write the output JSON story to")
     update_parser.add_argument("--model", default=DEFAULT_MODEL, help="Claude model to use")
     update_parser.add_argument("--push", action="store_true", help="Also push the updated story to Jira")
     update_parser.add_argument("--attach-brd", action="store_true", help="Attach the BRD file itself to the Jira issue (requires --push)")
 
+    enrich_parser = subparsers.add_parser(
+        "enrich",
+        help="Expand an existing story's own content into full detail. No BRD needed.",
+    )
+    enrich_source = enrich_parser.add_mutually_exclusive_group(required=True)
+    enrich_source.add_argument("--existing-story", help="Path to existing story (.json/.txt/.md)")
+    enrich_source.add_argument("--jira-key", help="Jira issue key to fetch live, e.g. BOX-142 (requires JIRA_* env vars)")
+    enrich_parser.add_argument("--output", required=True, help="Path to write the output JSON story to")
+    enrich_parser.add_argument("--model", default=DEFAULT_MODEL, help="Claude model to use")
+    enrich_parser.add_argument("--push", action="store_true", help="Also push the expanded story to Jira (needs edit permission on the issue)")
+
     args = parser.parse_args()
 
-    brd_text = extract_text_from_file(args.brd)
-    if not brd_text.strip():
-        print("Warning: extracted BRD text is empty. Check the input file.", file=sys.stderr)
-
     existing_key = ""
+
     if args.mode == "new":
+        brd_text = extract_text_from_file(args.brd)
+        if not brd_text.strip():
+            print("Warning: extracted BRD text is empty. Check the input file.", file=sys.stderr)
         prompt = build_new_story_prompt(brd_text)
-    else:  # update
+
+    elif args.mode == "update":
+        brd_text = extract_text_from_file(args.brd)
+        if not brd_text.strip():
+            print("Warning: extracted BRD text is empty. Check the input file.", file=sys.stderr)
         if args.jira_key:
             print(f"Fetching {args.jira_key} from Jira...")
             existing_story = fetch_story_from_jira(args.jira_key)
@@ -529,13 +637,28 @@ def main():
         existing_key = existing_story.get("key", "")
         prompt = build_update_story_prompt(brd_text, existing_story)
 
+    else:  # enrich — no BRD, source is the existing story alone
+        if args.jira_key:
+            print(f"Fetching {args.jira_key} from Jira...")
+            existing_story = fetch_story_from_jira(args.jira_key)
+        else:
+            existing_story = load_existing_story(args.existing_story)
+        existing_key = existing_story.get("key", "")
+        prompt = build_enrich_only_prompt(existing_story)
+
     print(f"Generating story via Claude ({args.model})...")
     story = generate_story(prompt, model=args.model)
 
-    output_path = Path(args.output)
+    output_path = build_output_path(args.output, existing_key)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(story, f, indent=2)
+
+    if output_path.suffix.lower() == ".md":
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write(story_to_markdown(story, key=existing_key))
+    else:
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(story, f, indent=2)
+
     print(f"Story written to {output_path}")
     print(f"  Summary: {story['summary']}")
     print(f"  Acceptance criteria: {len(story['acceptance_criteria'])}")
@@ -543,13 +666,47 @@ def main():
     print(f"  Negative test cases: {len(story['negative_test_cases'])}")
     print(f"  Exit criteria: {len(story['exit_criteria'])}")
 
+    if existing_key:
+        browse_url = jira_browse_url(existing_key)
+        if browse_url:
+            print(f"  Jira story: {browse_url}")
+
     if args.push:
         print("Pushing to Jira...")
-        attach_path = args.brd if args.attach_brd else ""
-        result = push_to_jira(story, existing_key=existing_key, attach_path=attach_path)
-        print(f"Jira {result['action']} issue: {result['key']}")
+        attach_path = getattr(args, "brd", None) if getattr(args, "attach_brd", False) else ""
+        try:
+            result = push_to_jira(story, existing_key=existing_key, attach_path=attach_path)
+        except RuntimeError as e:
+            print(f"\nPush failed: {e}", file=sys.stderr)
+            print(
+                f"\nThe story was still generated and saved locally at {output_path} — "
+                "you can copy/paste it into Jira manually if you don't have push/edit "
+                "permission on this issue.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        new_key = result["key"]
+        print(f"Jira {result['action']} issue: {new_key}")
+
+        # For brand-new issues, the key wasn't known until after the push —
+        # rename the already-written local file now that we have it.
+        if result["action"] == "created" and new_key:
+            final_path = build_output_path(args.output, new_key)
+            if final_path != output_path:
+                output_path.rename(final_path)
+                output_path = final_path
+                print(f"  Renamed local file to: {output_path}")
+
         if attach_path:
             print(f"  Attached BRD: {Path(attach_path).name}")
+
+        browse_url = jira_browse_url(new_key)
+        if browse_url:
+            print(f"  Jira story: {browse_url}")
+    else:
+        print(f"\n(--push not used — nothing was written to Jira. Review {output_path} "
+              f"and copy/paste it into the issue manually if needed.)")
 
 
 if __name__ == "__main__":
